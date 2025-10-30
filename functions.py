@@ -11,6 +11,7 @@ import cv2
 from queue import Queue, Empty
 from vmbpy import *
 import os
+import time
 cam = None                      # variable for contolling camera features
 vmb = None                     # vimba system
 
@@ -437,3 +438,204 @@ def display_pattern_second_screen(pattern, resize_w, resize_h, displacement):
     cv2.resizeWindow('pattern', resize_w, resize_h)
     cv2.moveWindow('pattern', displacement,0)
     cv2.waitKey(1)
+
+
+
+def phase_shifting_loop(cam, vmb, patterns_to_project, path_folder):
+    
+    """
+    Loop where the acquisition of shifted-pattern frames will happen
+    """
+    print("Frames acquisition has started...")
+
+    delay_camera_screen  = 500E-3   # delay to sinchronize screen projection and camera acquisition
+    shifted_frames = []             # List for storing the acquired frames
+    fringe_shift_counter = 0        # fringe shift counter to guarantee the phase shifting-technique
+    while True:
+        cv2.imshow('pattern',((patterns_to_project[fringe_shift_counter])))
+        cv2.waitKey(1)
+        time.sleep(delay_camera_screen)
+
+        # to save image under uniform illumination
+        if fringe_shift_counter == 5:
+            cam.set_pixel_format(PixelFormat.Rgb8) 
+            frame = cam.get_frame()
+            frame = frame.as_numpy_ndarray()
+            frame = np.squeeze(frame)
+            cv2.imwrite(path_folder+f"/Phase_{fringe_shift_counter}color.png", frame)
+
+        # acquiring and saving the shifted-phase
+        cam.set_pixel_format(PixelFormat.Mono8) 
+        frame = cam.get_frame()
+        frame = frame.as_numpy_ndarray()
+        frame = np.squeeze(frame)
+        cv2.imwrite(path_folder + f"/Phase_{fringe_shift_counter}.png", frame)
+
+        # storing the frame for post-processing
+        shifted_frames.append(frame)
+        fringe_shift_counter +=1
+
+        # finish at the sixth capture
+        if fringe_shift_counter == 6 :
+            cv2.destroyAllWindows()
+            break
+    return shifted_frames
+
+
+
+def run_camera_and_fringes_ui(
+    freq_ini: float,
+    screen_width: int,
+    screen_height: int,
+    pattern_resize_w: int,
+    pattern_resize_h: int,
+    pattern_displacement_x: int = 1920,   # move 1920 pixels the second screen
+    pattern_displacement_y: int = 0,
+    slider_fig_size=(3, 2)
+):
+    """
+    -Slider(freq, angle of fringes in main window)
+    -Projected fringes on second screen
+    -OpenCV visualization of the camera 
+    -Close any window o press ESC and the code will continue
+    -returns the list of projected pattern to display and make the phase shift
+    -5 sinusoidal patterns with phase: [0, π/2, π, 3π/2, 2π]  and 1 for uniform illumination
+    """
+
+    # geometrý 
+    # Meshgrid
+    x = np.linspace(-5, 5, screen_width)
+    y = np.linspace(-5, 5, screen_height)
+    X, Y = np.meshgrid(x, y)
+
+    # sliders state
+    state = {
+        'freq': float(freq_ini),
+        'angle': 0.0,
+        'stop': False,
+    }
+
+    #  slider fig (Matplotlib)
+    fig_sliders, (ax_freq, ax_angle) = plt.subplots(2, 1, figsize=slider_fig_size)
+    plt.subplots_adjust(left=0.2, bottom=0.3, top=0.95)
+    fig_sliders.canvas.manager.set_window_title('Fringe Controls')
+
+    slider_freq = Slider(ax_freq, 'Frequency', valmin=0.0, valmax=5.0,
+                         valinit=freq_ini, valstep=0.05)
+    slider_angle = Slider(ax_angle, 'Rotation', valmin=0.0, valmax=2*np.pi,
+                          valinit=0.0, valstep=np.pi/4)
+
+    def on_change(_):
+        state['freq'] = float(slider_freq.val)
+        state['angle'] = float(slider_angle.val)
+    slider_freq.on_changed(on_change)
+    slider_angle.on_changed(on_change)
+
+    def on_close_matplotlib(event):
+        state['stop'] = True
+    fig_sliders.canvas.mpl_connect('close_event', on_close_matplotlib)
+
+    # display the slider plot and do not block the code
+    plt.show(block=False)
+
+    #  WINDOWS OpenCV (pattern and camera) 
+    # Ventana de franjas en segunda pantalla
+    WIN_PATTERN = 'pattern'
+    cv2.namedWindow(WIN_PATTERN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN_PATTERN, pattern_resize_w, pattern_resize_h)
+    cv2.moveWindow(WIN_PATTERN, pattern_displacement_x, pattern_displacement_y)
+
+    # camera window
+    WIN_CAMERA = 'camera'
+    cv2.namedWindow(WIN_CAMERA, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.setWindowProperty(WIN_CAMERA, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    # asynchronous for vimba
+    q = Queue(maxsize=1)
+
+    def frame_handler(cam: Camera, stream: Stream, frame: Frame):
+        """Callback corto: convierte a Mono8, copia numpy y reencola; siempre requeue."""
+        try:
+            frame.convert_pixel_format(PixelFormat.Mono8)
+            img = frame.as_opencv_image().copy()
+            # Dejar solo el más reciente
+            try:
+                q.get_nowait()
+            except Empty:
+                pass
+            q.put_nowait(img)
+        finally:
+            stream.queue_frame(frame)
+
+    # context
+    with VmbSystem.get_instance() as vmb:
+        cams = vmb.get_all_cameras()
+        if not cams:
+            plt.close(fig_sliders)
+            cv2.destroyAllWindows()
+            raise RuntimeError("no detected camera.")
+
+        with cams[0] as cam:
+            cam.start_streaming(frame_handler)
+
+            try:
+                while not state['stop']:
+                    # close if any window is closed
+                    if cv2.getWindowProperty(WIN_CAMERA, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                    if cv2.getWindowProperty(WIN_PATTERN, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+
+                    # ==== Camera ====
+                    try:
+                        img = q.get(timeout=0.01)
+                        cv2.imshow(WIN_CAMERA, img)
+                    except Empty:
+                        pass
+
+                    # ==== fringes
+                    coord_rot = X * np.cos(state['angle']) + Y * np.sin(state['angle'])
+                    patt = np.sin(2 * np.pi * state['freq'] * coord_rot)  # fase 0
+                    # Normalizar a 8 bits para visualización con OpenCV
+                    patt_u8 = ((patt - patt.min()) / (patt.max() - patt.min() + 1e-12) * 255.0).astype(np.uint8)
+                    cv2.imshow(WIN_PATTERN, patt_u8)
+
+                    # ==== events 
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:  # ESC
+                        break
+
+                    plt.pause(0.001)
+
+            finally:
+                cam.stop_streaming()
+
+    # close the cv2 windows and matplotlib ones
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+    try:
+        plt.close(fig_sliders)
+    except Exception:
+        pass
+
+    
+    # generation of patterns
+    freq_final = state['freq']
+    angle_final = state['angle']
+    phase_shift = [0, np.pi/2, np.pi, 3*np.pi/2, 2*np.pi, 1]  # el "1" indicates uniform illumination
+
+    projected_pattern = []
+    coord_rot_final = X * np.cos(angle_final) + Y * np.sin(angle_final)
+
+    for shifting in phase_shift:
+        if shifting != 1:
+            pat = np.sin(2 * np.pi * freq_final * coord_rot_final + shifting)
+            pat_u8 = np.uint8(((pat - pat.min()) / (pat.max() - pat.min() + 1e-12)) * 255.0)
+            projected_pattern.append(pat_u8)
+        else:
+            # uniform illumination
+            pat_uniform = np.sin(0 * coord_rot_final + np.pi/4)
+            projected_pattern.append(pat_uniform)  
+    return projected_pattern
